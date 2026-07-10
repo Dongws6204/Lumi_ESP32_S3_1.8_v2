@@ -827,14 +827,15 @@ private:
                                return true;
                            });
         mcp_server.AddTool("self.led.control",
-                           "Control the external SK6812 RGBWW LED strip. Use it for phrases like: "
-                           "bật đèn=>action on, tắt đèn=>off, đổi màu đỏ=>set_color red, "
-                           "trắng ấm=>set_color warm_white, tăng sáng=>increase_brightness, "
-                           "giảm sáng=>decrease_brightness, độ sáng 80%=>set_brightness 80. "
-                           "action: on/off/set_color/set_brightness/increase_brightness/"
-                           "decrease_brightness. status: on/off. color: "
-                           "warm_white/ww/red/green/blue/yellow/purple/cyan/#RRGGBB. "
-                           "brightness: 0-100 (clamped to 5..80). step: brightness delta.",
+                           "Control the external SK6812 RGBWW LED strip. Actions: on/off/set_color/set_brightness/increase_brightness/decrease_brightness. "
+                            "Color options: warm_white/ww/red/green/blue/yellow/purple/cyan or #RRGGBB hex code. Brightness: 0-100 (clamped to 5..80). "
+                            "IMPORTANT: The device's microphone may produce severe STT (Speech-to-Text) phonetic errors. "
+                            "If the input has 'ắt', 'ắt đèn', 'gắt' -> interpret as action='off'. "
+                            "If the input has 'ật', 'ật đèn', 'mở', 'bật' -> interpret as action='on'. "
+                            "If the input has 'ăng', 'nâng' related to light -> interpret as action='increase_brightness'. "
+                            "If the input has 'ảm', 'iảm', 'bớt' related to light -> interpret as action='decrease_brightness'. "
+                            "If the user mentions a color or hex code without action -> interpret as action='set_color'. "
+                            "DO NOT ask the user to repeat; make the best logical guess based on these corrupted speech fragments.",
                            PropertyList({
                                Property("action", kPropertyTypeString, std::string("set_color")),
                                Property("status", kPropertyTypeString, std::string("on")),

@@ -113,9 +113,12 @@ void McpServer::AddCommonTools() {
             });
 
     AddTool("self.audio.volume",
-            "Control the audio speaker volume. Use it for phrases like: âm lượng 60%, tăng âm "
-            "lượng, giảm âm lượng, tắt tiếng, bật tiếng. action: "
-            "set/increase/decrease/mute/unmute. volume: 0-100. step: default 10.",
+            "Control the audio speaker volume. Actions: set/increase/decrease/mute/unmute. volume: 0-100. step: default 10. "
+            "IMPORTANT: The device's microphone may produce STT (Speech-to-Text) errors due to poor audio capture. "
+            "If the input contains corrupted words like 'ăng', 'nâng', 'thêm' -> interpret as action='increase'. "
+            "If the input contains corrupted words like 'ảm', 'iảm', 'giảm', 'bớt' -> interpret as action='decrease'. "
+            "If the user says 'âm lượng' followed by a number, or just a number contextually related to sound -> interpret as action='set'. "
+            "DO NOT ask the user for clarification; make the best logical guess based on these phonetic errors.",
             PropertyList({Property("action", kPropertyTypeString, std::string("set")),
                           Property("volume", kPropertyTypeInteger, 70, 0, 100),
                           Property("step", kPropertyTypeInteger, 10, 1, 100)}),
