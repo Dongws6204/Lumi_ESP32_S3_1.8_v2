@@ -9,6 +9,7 @@
 #include <string>
 #include <mutex>
 #include <deque>
+#include <map>
 #include <memory>
 #include <functional>
 
@@ -17,6 +18,8 @@
 #include "audio_service.h"
 #include "device_state.h"
 #include "device_state_machine.h"
+
+struct DeviceTimerContext;
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -32,6 +35,8 @@
 #define MAIN_EVENT_START_LISTENING      (1 << 10)
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+
+#define LISTENING_SILENCE_TIMEOUT_SECONDS 8
 
 
 enum AecMode {
@@ -123,6 +128,9 @@ public:
     void PlaySound(const std::string_view& sound);
     std::string PlayMusic(const std::string& url, const std::string& title, int volume);
     std::string StopMusic();
+    std::string SetDeviceTimer(const std::string& action, int delay_minutes);
+    void ExecuteDeviceTimerAction(const std::string& action);
+    void EnterIdleSleep(const char* reason);
     void QueuePendingMusic(const std::string& url, const std::string& title, int volume);
     bool HasPendingMusic();
     PendingMusicRequest TakePendingMusic();
@@ -142,10 +150,13 @@ private:
 
     std::mutex mutex_;
     std::mutex pending_music_mutex_;
+    std::mutex timer_mutex_;
+    std::map<std::string, DeviceTimerContext*> timer_registry_;
     std::deque<std::function<void()>> main_tasks_;
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    int64_t last_voice_activity_us_ = 0;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     ListeningMode pending_start_listening_mode_ = kListeningModeManualStop;

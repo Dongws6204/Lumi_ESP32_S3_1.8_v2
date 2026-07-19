@@ -12,6 +12,8 @@
 #include "settings.h"
 
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -20,6 +22,67 @@
 
 #define TAG "Application"
 
+namespace {
+}
+
+struct DeviceTimerContext {
+    Application* app;
+    esp_timer_handle_t timer;
+    std::string action;
+    std::mutex lifecycle_mutex;
+    bool callback_started = false;
+    bool timer_deleted = false;
+    bool cancelled = false;
+};
+
+namespace {
+
+bool IsIdleLike(DeviceState state) {
+    return DeviceStateMachine::IsIdleState(state);
+}
+
+std::string ToLowerAscii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
+bool ContainsSleepCommand(const std::string& text) {
+    auto lower = ToLowerAscii(text);
+
+    // ASCII (no diacritics) patterns — matched against tolower'd text
+    static const char* ascii_patterns[] = {
+        "tat di",       // tắt đi
+        "di ngu",       // đi ngủ
+        "tat may",      // tắt máy
+        "ngu thoi",     // ngủ thôi
+        "nghi di",      // nghỉ đi
+        "sleep",
+    };
+    for (auto* p : ascii_patterns) {
+        if (lower.find(p) != std::string::npos) {
+            return true;
+        }
+    }
+
+    // UTF-8 patterns with Vietnamese diacritics — matched against original text
+    // Include both lowercase and STT-typical capitalized forms
+    static const char* utf8_patterns[] = {
+        "tắt đi",   "Tắt đi",
+        "đi ngủ",   "Đi ngủ",
+        "tắt máy",  "Tắt máy",
+        "ngủ thôi", "Ngủ thôi",
+        "nghỉ đi",  "Nghỉ đi",
+    };
+    for (auto* p : utf8_patterns) {
+        if (text.find(p) != std::string::npos) {
+            return true;
+        }
+    }
+
+    return false;
+}
+}
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -82,6 +145,9 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
+        if (speaking) {
+            last_voice_activity_us_ = esp_timer_get_time();
+        }
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     audio_service_.SetCallbacks(callbacks);
@@ -97,6 +163,18 @@ void Application::Initialize() {
     // Add MCP common tools (only once during initialization)
     auto& mcp_server = McpServer::GetInstance();
     mcp_server.AddCommonTools();
+    mcp_server.AddTool("set_device_timer",
+            "Set a relative countdown timer. action is executed locally by the device timer callback without waking the LLM loop. "
+            "For lighting, pass either a local command string or a JSON-RPC tools/call payload for the target light tool. delay_minutes is relative time.",
+            PropertyList({
+                Property("action", kPropertyTypeString),
+                Property("delay_minutes", kPropertyTypeInteger, 1, 1, 1440),
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto action = properties["action"].value<std::string>();
+                int delay_minutes = properties["delay_minutes"].value<int>();
+                return Application::GetInstance().SetDeviceTimer(action, delay_minutes);
+            });
     mcp_server.AddUserOnlyTools();
 
     // Set network event callback for UI updates and network state handling
@@ -186,7 +264,7 @@ void Application::Run() {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & MAIN_EVENT_ERROR) {
-            SetDeviceState(kDeviceStateIdle);
+            EnterIdleSleep("error");
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
         }
 
@@ -250,6 +328,13 @@ void Application::Run() {
             clock_ticks_++;
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
+
+            if (GetDeviceState() == kDeviceStateListening && last_voice_activity_us_ > 0) {
+                int64_t silent_us = esp_timer_get_time() - last_voice_activity_us_;
+                if (silent_us >= LISTENING_SILENCE_TIMEOUT_SECONDS * 1000000LL) {
+                    EnterIdleSleep("listening_silence_timeout");
+                }
+            }
         
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
@@ -301,7 +386,7 @@ void Application::HandleActivationDoneEvent() {
     ESP_LOGI(TAG, "Activation done");
 
     SystemInfo::PrintHeapStats();
-    SetDeviceState(kDeviceStateIdle);
+    SetDeviceState(kDeviceStateIdleSleep);
 
     has_server_time_ = ota_->HasServerTime();
 
@@ -423,7 +508,7 @@ void Application::CheckNewVersion() {
             ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
             for (int i = 0; i < retry_delay; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                if (GetDeviceState() == kDeviceStateIdle) {
+                if (IsIdleLike(GetDeviceState())) {
                     break;
                 }
             }
@@ -466,7 +551,7 @@ void Application::CheckNewVersion() {
             } else {
                 vTaskDelay(pdMS_TO_TICKS(10000));
             }
-            if (GetDeviceState() == kDeviceStateIdle) {
+            if (IsIdleLike(GetDeviceState())) {
                 break;
             }
         }
@@ -517,7 +602,7 @@ void Application::InitializeProtocol() {
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
+            SetDeviceState(kDeviceStateIdleSleep);
         });
     });
     
@@ -536,9 +621,9 @@ void Application::InitializeProtocol() {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
-                            SetDeviceState(kDeviceStateIdle);
+                            SetDeviceState(kDeviceStateIdleSleep);
                         } else {
-                            SetDeviceState(kDeviceStateListening);
+                            SetListeningMode(listening_mode_);
                         }
                     }
                     Schedule([this]() {
@@ -558,6 +643,10 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+                if (ContainsSleepCommand(text->valuestring)) {
+                    EnterIdleSleep("voice_sleep_command");
+                    return;
+                }
                 Schedule([display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -669,7 +758,7 @@ void Application::Alert(const char* status, const char* message, const char* emo
 }
 
 void Application::DismissAlert() {
-    if (GetDeviceState() == kDeviceStateIdle) {
+    if (IsIdleLike(GetDeviceState())) {
         auto display = Board::GetInstance().GetDisplay();
         display->SetStatus(Lang::Strings::STANDBY);
         display->SetEmotion("neutral");
@@ -683,6 +772,7 @@ std::string Application::PlayMusic(const std::string& url, const std::string& ti
         return "queued: Da xep hang phat nhac";
     }
 
+    audio_service_.LogAecLoopbackReference("MusicPlayer::Play");
     return MusicPlayer::GetInstance().Play(audio_service_, url, title, volume);
 }
 
@@ -693,6 +783,186 @@ std::string Application::StopMusic() {
         return "Da huy nhac dang cho";
     }
     return response;
+}
+
+std::string Application::SetDeviceTimer(const std::string& action, int delay_minutes) {
+    if (action.empty()) {
+        return "Loi: action khong duoc rong";
+    }
+    if (delay_minutes <= 0) {
+        return "Loi: delay_minutes phai lon hon 0";
+    }
+
+    bool replaced = false;
+
+    // Remove the old entry first. Do not hold timer_mutex_ while taking the
+    // context lifecycle lock: the timer callback takes those locks in the
+    // opposite order while it removes itself from the registry.
+    DeviceTimerContext* old_context = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        auto it = timer_registry_.find(action);
+        if (it != timer_registry_.end()) {
+            old_context = it->second;
+            timer_registry_.erase(it);
+        }
+    }
+    if (old_context != nullptr) {
+        replaced = true;
+        ESP_LOGI(TAG, "[TIMER] replaced existing timer for action: %s", action.c_str());
+
+        // The callback may already be queued on ESP_TIMER_TASK. Serialize
+        // cancellation with callback startup before releasing the context.
+        bool callback_started = false;
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(old_context->lifecycle_mutex);
+            old_context->cancelled = true;
+            callback_started = old_context->callback_started;
+            esp_timer_stop(old_context->timer);
+            if (!old_context->timer_deleted) {
+                esp_timer_delete(old_context->timer);
+                old_context->timer_deleted = true;
+            }
+        }
+        // If the callback already started, it owns cleanup. Otherwise no
+        // callback can use this context after timer deletion.
+        if (!callback_started) {
+            delete old_context;
+        }
+    }
+
+    auto* context = new DeviceTimerContext{
+        .app = this,
+        .timer = nullptr,
+        .action = action,
+    };
+
+    esp_timer_create_args_t timer_args = {
+        .callback = [](void* arg) {
+            auto* context = static_cast<DeviceTimerContext*>(arg);
+            bool cancelled = false;
+            {
+                std::lock_guard<std::mutex> lifecycle_lock(context->lifecycle_mutex);
+                context->callback_started = true;
+                cancelled = context->cancelled;
+                if (!context->timer_deleted) {
+                    esp_timer_delete(context->timer);
+                    context->timer_deleted = true;
+                }
+            }
+
+            // Remove from registry before executing (timer already fired).
+            {
+                std::lock_guard<std::mutex> lock(context->app->timer_mutex_);
+                auto it = context->app->timer_registry_.find(context->action);
+                if (it != context->app->timer_registry_.end() && it->second == context) {
+                    context->app->timer_registry_.erase(it);
+                }
+            }
+
+            if (cancelled) {
+                delete context;
+                return;
+            }
+
+            ESP_LOGI(TAG, "[TIMER] triggered action: %s", context->action.c_str());
+            if (xTaskCreate([](void* task_arg) {
+                    auto* ctx = static_cast<DeviceTimerContext*>(task_arg);
+                    ctx->app->ExecuteDeviceTimerAction(ctx->action);
+                    delete ctx;
+                    vTaskDelete(nullptr);
+                }, "device_timer_action", 4096, context, 4, nullptr) != pdPASS) {
+                ESP_LOGE(TAG, "[TIMER] failed to create timer action task");
+                delete context;
+            }
+        },
+        .arg = context,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "device_timer",
+        .skip_unhandled_events = true,
+    };
+
+    esp_err_t err = esp_timer_create(&timer_args, &context->timer);
+    if (err != ESP_OK) {
+        delete context;
+        return "Loi: khong tao duoc timer";
+    }
+
+    err = esp_timer_start_once(context->timer, delay_minutes * 60LL * 1000000LL);
+    if (err != ESP_OK) {
+        esp_timer_delete(context->timer);
+        delete context;
+        return "Loi: khong start duoc timer";
+    }
+
+    // Register the new timer
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        timer_registry_[action] = context;
+    }
+
+    ESP_LOGI(TAG, "[TIMER] action %s in %d minute(s): %s",
+             replaced ? "replaced" : "scheduled", delay_minutes, action.c_str());
+    return replaced
+        ? "Da thay the hen gio " + std::to_string(delay_minutes) + " phut"
+        : "Da hen gio " + std::to_string(delay_minutes) + " phut";
+}
+
+void Application::ExecuteDeviceTimerAction(const std::string& action) {
+    ESP_LOGI(TAG, "[TIMER] trigger action: %s", action.c_str());
+
+    auto lower = ToLowerAscii(action);
+    if (ContainsSleepCommand(action) || lower == "sleep" || lower == "idle_sleep") {
+        EnterIdleSleep("timer_sleep_action");
+        return;
+    }
+
+    if (lower == "stop_music" || lower == "music.stop") {
+        StopMusic();
+        return;
+    }
+
+    cJSON* json = cJSON_Parse(action.c_str());
+    if (json != nullptr) {
+        if (cJSON_IsObject(json)) {
+            // Thêm trường "id" mặc định nếu thiếu (vì ParseMessage yêu cầu bắt buộc)
+            if (!cJSON_HasObjectItem(json, "id")) {
+                cJSON_AddNumberToObject(json, "id", 0);
+            }
+            McpServer::GetInstance().ParseMessage(json);
+        } else {
+            ESP_LOGW(TAG, "[TIMER] JSON action must be an object");
+        }
+        cJSON_Delete(json);
+        return;
+    }
+
+    ESP_LOGW(TAG, "[TIMER] unsupported plain action; use JSON-RPC tools/call payload for device tools");
+}
+
+void Application::EnterIdleSleep(const char* reason) {
+    std::string reason_copy = reason != nullptr ? reason : "idle_sleep";
+    Schedule([this, reason_copy]() {
+        ESP_LOGI(TAG, "[POWER] enter IDLE_SLEEP: %s", reason_copy.c_str());
+
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            if (GetDeviceState() == kDeviceStateListening) {
+                protocol_->SendStopListening();
+            }
+            protocol_->CloseAudioChannel();
+        }
+
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.ResetDecoder();
+        audio_service_.EnableWakeWordDetection(true);
+        Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+
+        auto state = GetDeviceState();
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            SetDeviceState(kDeviceStateTimeout);
+        }
+        SetDeviceState(kDeviceStateIdleSleep);
+    });
 }
 
 void Application::QueuePendingMusic(const std::string& url, const std::string& title, int volume) {
@@ -801,7 +1071,7 @@ void Application::HandleToggleChatEvent() {
     }
     
     if (state == kDeviceStateActivating) {
-        SetDeviceState(kDeviceStateIdle);
+        SetDeviceState(kDeviceStateIdleSleep);
         return;
     } else if (state == kDeviceStateWifiConfiguring) {
         audio_service_.EnableAudioTesting(true);
@@ -818,7 +1088,7 @@ void Application::HandleToggleChatEvent() {
         return;
     }
 
-    if (state == kDeviceStateIdle) {
+    if (IsIdleLike(state)) {
         ListeningMode mode = GetDefaultListeningMode();
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
@@ -848,6 +1118,10 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            ESP_LOGW(TAG, "OpenAudioChannel failed (start_listening), recovering to idle_sleep");
+            audio_service_.EnableWakeWordDetection(true);
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            SetDeviceState(kDeviceStateIdleSleep);
             return;
         }
     }
@@ -864,7 +1138,7 @@ void Application::HandleStartListeningEvent() {
     }
     
     if (state == kDeviceStateActivating) {
-        SetDeviceState(kDeviceStateIdle);
+        SetDeviceState(kDeviceStateIdleSleep);
         return;
     } else if (state == kDeviceStateWifiConfiguring) {
         audio_service_.EnableAudioTesting(true);
@@ -877,7 +1151,7 @@ void Application::HandleStartListeningEvent() {
         return;
     }
     
-    if (state == kDeviceStateIdle) {
+    if (IsIdleLike(state)) {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
@@ -890,6 +1164,31 @@ void Application::HandleStartListeningEvent() {
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
         SetListeningMode(mode);
+    } else if (state == kDeviceStateListening) {
+        bool should_restart_listening =
+            listening_mode_ != mode || !audio_service_.IsAudioProcessorRunning();
+        listening_mode_ = mode;
+        if (should_restart_listening) {
+            if (!protocol_->IsAudioChannelOpened()) {
+                SetDeviceState(kDeviceStateIdleSleep);
+                SetDeviceState(kDeviceStateConnecting);
+                Schedule([this, mode]() {
+                    ContinueOpenAudioChannel(mode);
+                });
+                return;
+            }
+            if (listening_mode_ == kListeningModeAutoStop) {
+                audio_service_.WaitForPlaybackQueueEmpty();
+            }
+            protocol_->SendStartListening(listening_mode_);
+            audio_service_.EnableVoiceProcessing(true);
+        }
+
+#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
+        audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#else
+        audio_service_.EnableWakeWordDetection(false);
+#endif
     }
 }
 
@@ -904,7 +1203,7 @@ void Application::HandleStopListeningEvent() {
         if (protocol_) {
             protocol_->SendStopListening();
         }
-        SetDeviceState(kDeviceStateIdle);
+        EnterIdleSleep("stop_listening");
     }
 }
 
@@ -916,14 +1215,14 @@ void Application::HandleWakeWordDetectedEvent() {
     if (MusicPlayer::GetInstance().IsActive() || HasPendingMusic()) {
         ESP_LOGI(TAG, "[MUSIC] wake-word interrupt: stop music");
         StopMusic();
-        SetDeviceState(kDeviceStateIdle);
+        SetDeviceState(kDeviceStateIdleSleep);
     }
 
     auto state = GetDeviceState();
     auto wake_word = audio_service_.GetLastWakeWord();
     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
 
-    if (state == kDeviceStateIdle) {
+    if (IsIdleLike(state)) {
         audio_service_.EncodeWakeWord();
         auto wake_word = audio_service_.GetLastWakeWord();
 
@@ -956,7 +1255,7 @@ void Application::HandleWakeWordDetectedEvent() {
         }
     } else if (state == kDeviceStateActivating) {
         // Restart the activation check if the wake word is detected during activation
-        SetDeviceState(kDeviceStateIdle);
+        SetDeviceState(kDeviceStateIdleSleep);
     }
 }
 
@@ -972,7 +1271,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            ESP_LOGW(TAG, "OpenAudioChannel failed (wake_word), recovering to idle_sleep");
             audio_service_.EnableWakeWordDetection(true);
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            SetDeviceState(kDeviceStateIdleSleep);
             return;
         }
     }
@@ -1006,11 +1308,13 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+        case kDeviceStateIdleSleep:
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
-            display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+            display->SetEmotion(new_state == kDeviceStateIdleSleep ? "sleepy" : "neutral");
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1059,6 +1363,11 @@ void Application::HandleStateChangedEvent() {
             }
             audio_service_.ResetDecoder();
             break;
+        case kDeviceStateTimeout:
+            display->SetStatus(Lang::Strings::STANDBY);
+            display->SetEmotion("sleepy");
+            EnterIdleSleep("state_timeout");
+            break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(false);
@@ -1087,6 +1396,7 @@ void Application::AbortSpeaking(AbortReason reason) {
 
 void Application::SetListeningMode(ListeningMode mode) {
     listening_mode_ = mode;
+    last_voice_activity_us_ = esp_timer_get_time();
     SetDeviceState(kDeviceStateListening);
 }
 
@@ -1167,7 +1477,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 
     auto state = GetDeviceState();
     
-    if (state == kDeviceStateIdle) {
+    if (IsIdleLike(state)) {
         audio_service_.EncodeWakeWord();
 
         if (!protocol_->IsAudioChannelOpened()) {
@@ -1194,7 +1504,7 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 bool Application::CanEnterSleepMode() {
-    if (GetDeviceState() != kDeviceStateIdle) {
+    if (!IsIdleLike(GetDeviceState())) {
         return false;
     }
 

@@ -2,7 +2,9 @@
 #define _OTA_H
 
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <esp_err.h>
 #include "board.h"

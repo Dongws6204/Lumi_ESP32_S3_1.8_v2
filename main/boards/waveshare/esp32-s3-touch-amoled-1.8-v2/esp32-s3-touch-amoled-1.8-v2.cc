@@ -11,6 +11,7 @@
 #include "i2c_device.h"
 #include "led/led.h"
 #include "mcp_server.h"
+#include "music_player.h"
 #include "power_save_timer.h"
 
 #include <driver/i2c_master.h>
@@ -410,6 +411,7 @@ private:
     CustomLcdDisplay* display_;
     CustomBacklight* backlight_;
     Sk6812RgbwwStrip* led_strip_ = nullptr;
+    lv_indev_t* touch_indev_ = nullptr;
     esp_io_expander_handle_t io_expander = NULL;
     PowerSaveTimer* power_save_timer_;
     TaskHandle_t power_button_task_handle_ = nullptr;
@@ -419,6 +421,7 @@ private:
     bool boot_auto_start_done_ = false;
     bool user_manual_stop_ = false;
     int64_t last_auto_start_us_ = 0;
+    int64_t last_music_touch_us_ = 0;
     bool returning_to_brookesia_ = false;
 
     static void PowerButtonTask(void* arg) {
@@ -439,6 +442,14 @@ private:
         self->RunAutoStartListeningLoop();
         self->auto_start_task_handle_ = nullptr;
         vTaskDelete(nullptr);
+    }
+
+    static void TouchEventCallback(lv_event_t* event) {
+        auto* self =
+            static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(lv_event_get_user_data(event));
+        if (self != nullptr) {
+            self->HandleTouchPressed();
+        }
     }
 
     bool TryAutoStartListening(const char* start_log) {
@@ -528,6 +539,29 @@ private:
         ESP_LOGI(TAG, "PWR short press: return to Brookesia factory partition");
         vTaskDelay(pdMS_TO_TICKS(100));
         esp_restart();
+    }
+
+    void HandleTouchPressed() {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_music_touch_us_ < 700 * 1000) {
+            return;
+        }
+
+        auto& app = Application::GetInstance();
+        if (!MusicPlayer::GetInstance().IsActive() && !app.HasPendingMusic()) {
+            return;
+        }
+
+        last_music_touch_us_ = now_us;
+        ESP_LOGI(TAG, "[MUSIC] touch interrupt: stop music and start listening");
+        app.Schedule([]() {
+            auto& app = Application::GetInstance();
+            if (!MusicPlayer::GetInstance().IsActive() && !app.HasPendingMusic()) {
+                return;
+            }
+            app.StopMusic();
+            app.StartListening(kListeningModeAutoStop);
+        });
     }
 
     void InitializePowerSaveTimer() {
@@ -812,7 +846,12 @@ private:
             .disp = lv_display_get_default(),
             .handle = tp,
         };
-        lvgl_port_add_touch(&touch_cfg);
+        touch_indev_ = lvgl_port_add_touch(&touch_cfg);
+        if (touch_indev_ != nullptr) {
+            lv_indev_add_event_cb(touch_indev_, TouchEventCallback, LV_EVENT_PRESSED, this);
+        } else {
+            ESP_LOGW(TAG, "Failed to register LVGL touch input");
+        }
         ESP_LOGI(TAG, "Touch panel initialized successfully");
     }
 

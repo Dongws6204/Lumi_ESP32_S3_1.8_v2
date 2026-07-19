@@ -37,6 +37,12 @@
 
 #define TAG "AudioService"
 
+namespace {
+constexpr float kMaxMicGainPercent = 80.0f;
+constexpr float kOptimizedMicGainPercent = 78.0f;
+constexpr float kLikelyMaxedMicGainPercent = 95.0f;
+}
+
 AudioService::AudioService() {
     event_group_ = xEventGroupCreate();
 }
@@ -62,6 +68,7 @@ AudioService::~AudioService() {
 void AudioService::Initialize(AudioCodec* codec) {
     codec_ = codec;
     codec_->Start();
+    OptimizeMicGain();
 
     esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(codec->output_sample_rate(), OPUS_FRAME_DURATION_MS);
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
@@ -731,4 +738,44 @@ bool AudioService::IsAfeWakeWord() {
 #else
     return false;
 #endif
+}
+
+bool AudioService::HasAecLoopbackReference() const {
+    return codec_ != nullptr && codec_->input_reference();
+}
+
+void AudioService::LogAecLoopbackReference(const char* context) const {
+    if (codec_ == nullptr) {
+        ESP_LOGW(TAG, "[AEC] %s: codec not initialized", context);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[AEC] %s: I2S loopback reference=%s input_channels=%d duplex=%s",
+             context,
+             codec_->input_reference() ? "active" : "inactive",
+             codec_->input_channels(),
+             codec_->duplex() ? "true" : "false");
+}
+
+void AudioService::OptimizeMicGain() {
+    if (codec_ == nullptr) {
+        return;
+    }
+
+    float gain = codec_->input_gain();
+    if (gain >= kLikelyMaxedMicGainPercent) {
+        codec_->SetInputGain(kOptimizedMicGainPercent);
+        ESP_LOGW(TAG, "[MIC] input gain %.1f looked maxed; clamped to %.1f to avoid clipping",
+                 gain, kOptimizedMicGainPercent);
+        return;
+    }
+
+    if (gain > kMaxMicGainPercent) {
+        codec_->SetInputGain(kMaxMicGainPercent);
+        ESP_LOGW(TAG, "[MIC] input gain %.1f above safe range; clamped to %.1f",
+                 gain, kMaxMicGainPercent);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[MIC] input gain %.1f kept below clipping range", gain);
 }

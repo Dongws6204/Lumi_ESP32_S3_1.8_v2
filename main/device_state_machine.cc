@@ -11,8 +11,10 @@ static const char* const STATE_STRINGS[] = {
     "starting",
     "wifi_configuring",
     "idle",
+    "idle_sleep",
     "connecting",
     "listening",
+    "timeout",
     "speaking",
     "upgrading",
     "activating",
@@ -58,39 +60,54 @@ bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) con
             return to == kDeviceStateWifiConfiguring;
 
         case kDeviceStateActivating:
-            // Can go to upgrading, idle, or back to wifi configuring (on error)
+            // Can go to upgrading, idle sleep, or back to wifi configuring (on error)
             return to == kDeviceStateUpgrading ||
                    to == kDeviceStateIdle ||
+                   to == kDeviceStateIdleSleep ||
                    to == kDeviceStateWifiConfiguring;
 
         case kDeviceStateUpgrading:
-            // Can go to idle (upgrade failed) or activating
+            // Can go to idle sleep (upgrade failed) or activating
             return to == kDeviceStateIdle ||
+                   to == kDeviceStateIdleSleep ||
                    to == kDeviceStateActivating;
 
         case kDeviceStateIdle:
+        case kDeviceStateIdleSleep:
             // Can go to connecting, listening (manual mode), speaking, activating, upgrading, or wifi configuring
             return to == kDeviceStateConnecting ||
                    to == kDeviceStateListening ||
                    to == kDeviceStateSpeaking ||
                    to == kDeviceStateActivating ||
                    to == kDeviceStateUpgrading ||
-                   to == kDeviceStateWifiConfiguring;
+                   to == kDeviceStateWifiConfiguring ||
+                   to == kDeviceStateIdle ||
+                   to == kDeviceStateIdleSleep;
 
         case kDeviceStateConnecting:
-            // Can go to idle (failed) or listening (success)
+            // Can go to idle sleep (failed) or listening (success)
             return to == kDeviceStateIdle ||
+                   to == kDeviceStateIdleSleep ||
                    to == kDeviceStateListening;
 
         case kDeviceStateListening:
-            // Can go to speaking or idle
+            // Can go to speaking, timeout, or idle sleep
             return to == kDeviceStateSpeaking ||
+                   to == kDeviceStateTimeout ||
+                   to == kDeviceStateIdle ||
+                   to == kDeviceStateIdleSleep;
+
+        case kDeviceStateTimeout:
+            // Timeout is a transient state that immediately falls back to idle sleep
+            return to == kDeviceStateIdleSleep ||
                    to == kDeviceStateIdle;
 
         case kDeviceStateSpeaking:
-            // Can go to listening or idle
+            // Can go to listening, timeout, or idle sleep
             return to == kDeviceStateListening ||
-                   to == kDeviceStateIdle;
+                   to == kDeviceStateTimeout ||
+                   to == kDeviceStateIdle ||
+                   to == kDeviceStateIdleSleep;
 
         case kDeviceStateFatalError:
             // Cannot transition out of fatal error
@@ -107,38 +124,38 @@ bool DeviceStateMachine::CanTransitionTo(DeviceState target) const {
 
 bool DeviceStateMachine::TransitionTo(DeviceState new_state) {
     DeviceState old_state = current_state_.load();
-    
-    // No-op if already in the target state
-    if (old_state == new_state) {
-        return true;
+
+    while (true) {
+        // No-op if already in the target state
+        if (old_state == new_state) {
+            return true;
+        }
+
+        // Validate the transition against the state that will be swapped.
+        if (!IsValidTransition(old_state, new_state)) {
+            ESP_LOGW(TAG, "Invalid state transition: %s -> %s",
+                     GetStateName(old_state), GetStateName(new_state));
+            return false;
+        }
+
+        if (current_state_.compare_exchange_weak(old_state, new_state)) {
+            ESP_LOGI(TAG, "State: %s -> %s",
+                     GetStateName(old_state), GetStateName(new_state));
+            NotifyStateChange(old_state, new_state);
+            return true;
+        }
     }
-
-    // Validate transition
-    if (!IsValidTransition(old_state, new_state)) {
-        ESP_LOGW(TAG, "Invalid state transition: %s -> %s",
-                 GetStateName(old_state), GetStateName(new_state));
-        return false;
-    }
-
-    // Perform transition
-    current_state_.store(new_state);
-    ESP_LOGI(TAG, "State: %s -> %s",
-             GetStateName(old_state), GetStateName(new_state));
-
-    // Notify callback
-    NotifyStateChange(old_state, new_state);
-    return true;
 }
 
 int DeviceStateMachine::AddStateChangeListener(StateCallback callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     int id = next_listener_id_++;
     listeners_.emplace_back(id, std::move(callback));
     return id;
 }
 
 void DeviceStateMachine::RemoveStateChangeListener(int listener_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     listeners_.erase(
         std::remove_if(listeners_.begin(), listeners_.end(),
             [listener_id](const auto& p) { return p.first == listener_id; }),
@@ -148,7 +165,7 @@ void DeviceStateMachine::RemoveStateChangeListener(int listener_id) {
 void DeviceStateMachine::NotifyStateChange(DeviceState old_state, DeviceState new_state) {
     std::vector<StateCallback> callbacks_copy;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
         callbacks_copy.reserve(listeners_.size());
         for (const auto& [id, cb] : listeners_) {
             callbacks_copy.push_back(cb);

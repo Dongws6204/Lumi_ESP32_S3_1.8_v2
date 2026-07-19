@@ -515,11 +515,11 @@ void McpServer::ParseCapabilities(const cJSON* capabilities) {
 }
 
 void McpServer::ParseMessage(const cJSON* json) {
-    // Check JSONRPC version
+    // Check JSONRPC version (relaxed: allow missing field for internal/timer commands)
     auto version = cJSON_GetObjectItem(json, "jsonrpc");
-    if (version == nullptr || !cJSON_IsString(version) ||
+    if (version != nullptr && cJSON_IsString(version) &&
         strcmp(version->valuestring, "2.0") != 0) {
-        ESP_LOGE(TAG, "Invalid JSONRPC version: %s", version ? version->valuestring : "null");
+        ESP_LOGE(TAG, "Invalid JSONRPC version: %s", version->valuestring);
         return;
     }
 

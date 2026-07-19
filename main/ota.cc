@@ -18,6 +18,7 @@
 #endif
 
 #include <cstring>
+#include <memory>
 #include <vector>
 #include <sstream>
 #include <algorithm>
@@ -33,7 +34,7 @@ Ota::Ota() {
         if (serial_number[0] == 0) {
             has_serial_number_ = false;
         } else {
-            serial_number_ = std::string(reinterpret_cast<char*>(serial_number), 32);
+            serial_number_ = std::string(reinterpret_cast<char*>(serial_number));
             has_serial_number_ = true;
         }
     }
@@ -129,15 +130,15 @@ esp_err_t Ota::CheckVersion() {
     // Parse the JSON response and check if the version is newer
     // If it is, set has_new_version_ to true and store the new version and URL
     
-    cJSON *root = cJSON_Parse(data.c_str());
-    if (root == NULL) {
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(data.c_str()), cJSON_Delete);
+    if (root == nullptr) {
         ESP_LOGE(TAG, "Failed to parse JSON response");
         return ESP_ERR_INVALID_RESPONSE;
     }
 
     has_activation_code_ = false;
     has_activation_challenge_ = false;
-    cJSON *activation = cJSON_GetObjectItem(root, "activation");
+    cJSON *activation = cJSON_GetObjectItem(root.get(), "activation");
     if (cJSON_IsObject(activation)) {
         cJSON* message = cJSON_GetObjectItem(activation, "message");
         if (cJSON_IsString(message)) {
@@ -160,7 +161,7 @@ esp_err_t Ota::CheckVersion() {
     }
 
     has_mqtt_config_ = false;
-    cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
+    cJSON *mqtt = cJSON_GetObjectItem(root.get(), "mqtt");
     if (cJSON_IsObject(mqtt)) {
         Settings settings("mqtt", true);
         cJSON *item = NULL;
@@ -190,7 +191,7 @@ esp_err_t Ota::CheckVersion() {
     }
 
     has_websocket_config_ = false;
-    cJSON *websocket = cJSON_GetObjectItem(root, "websocket");
+    cJSON *websocket = cJSON_GetObjectItem(root.get(), "websocket");
     if (cJSON_IsObject(websocket)) {
         Settings settings("websocket", true);
         cJSON *item = NULL;
@@ -211,7 +212,7 @@ esp_err_t Ota::CheckVersion() {
     }
 
     has_server_time_ = false;
-    cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
+    cJSON *server_time = cJSON_GetObjectItem(root.get(), "server_time");
     if (cJSON_IsObject(server_time)) {
         cJSON *timestamp = cJSON_GetObjectItem(server_time, "timestamp");
         cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
@@ -236,7 +237,7 @@ esp_err_t Ota::CheckVersion() {
     }
 
     has_new_version_ = false;
-    cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
+    cJSON *firmware = cJSON_GetObjectItem(root.get(), "firmware");
     if (cJSON_IsObject(firmware)) {
         cJSON *version = cJSON_GetObjectItem(firmware, "version");
         if (cJSON_IsString(version)) {
@@ -273,8 +274,6 @@ esp_err_t Ota::CheckVersion() {
     if (has_activation_code_) {
         ESP_LOGI(TAG, "[ACTIVATION] code=%s", activation_code_.c_str());
     }
-
-    cJSON_Delete(root);
     return ESP_OK;
 }
 

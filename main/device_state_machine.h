@@ -62,12 +62,15 @@ public:
      * Get state name string for logging
      */
     static const char* GetStateName(DeviceState state);
+    static bool IsIdleState(DeviceState state) {
+        return state == kDeviceStateIdle || state == kDeviceStateIdleSleep;
+    }
 
 private:
     std::atomic<DeviceState> current_state_{kDeviceStateUnknown};
     std::vector<std::pair<int, StateCallback>> listeners_;
     int next_listener_id_{0};
-    std::mutex mutex_;
+    std::recursive_mutex mutex_;
 
     /**
      * Check if transition from source to target is valid
